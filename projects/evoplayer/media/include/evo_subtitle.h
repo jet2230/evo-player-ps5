@@ -175,6 +175,13 @@ int  prospero_subtitle_get_cue_info(int is_secondary, int cue_index,
 int  prospero_subtitle_sample_random_cues(char *primary_out, size_t primary_sz,
                                          char *secondary_out, size_t secondary_sz);
 
+/* Same sampling, for the subtitle picker: never re-opens the media file.
+ * The picker runs on the UI thread, where the file re-open fallback froze the
+ * app for seconds on a large local file (a PGS track never fills the text
+ * ring, so every DOWN press paid the full open + scan). See FIX.md. */
+int  prospero_subtitle_preview_random_cues(char *primary_out, size_t primary_sz,
+                                           char *secondary_out, size_t secondary_sz);
+
 /* Sample cue texts for primary and secondary previews: reads from dialogue cue at
  * cue_index (0-based) or falls back to clock_seconds when cue_index < 0. */
 int  prospero_subtitle_sample_cue_text_by_index(double clock_seconds, int cue_index,

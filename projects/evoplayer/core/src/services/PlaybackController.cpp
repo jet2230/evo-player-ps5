@@ -105,6 +105,8 @@ int sceAudioOutClose(int handle);
 #include <algorithm>
 #include <cstdlib>
 
+#include "evo/PlayFmtLock.hpp"
+
 // Global playback instance
 extern pp_playback g_pp_pb;
 extern AVFormatContext *play_fmt;
@@ -448,6 +450,21 @@ static uint64_t GetCurrentTimeMs() {
     return static_cast<uint64_t>(tv.tv_sec) * 1000ULL + static_cast<uint64_t>(tv.tv_usec / 1000ULL);
 }
 
+/*
+ * FIX.md: play_fmt is walked by UI screens (the subtitle picker opens on
+ * DOWN) while startPlaybackSource/stopPlayback run on background workers.
+ * Take the context out under the lock, then close it with the lock released
+ * - avformat_close_input can block on network I/O, and the UI must never
+ * wait on that.
+ */
+static void close_play_fmt_safely(void) {
+    AVFormatContext *dead = nullptr;
+    evo_play_fmt_swap_out(&dead);
+    if (dead) {
+        avformat_close_input(&dead);
+    }
+}
+
 PlaybackController::PlaybackController()
     : m_playbackFsm(PlaybackState::Stopped, "PlaybackFSM")
 {
@@ -698,10 +715,7 @@ void PlaybackController::stopPlayback() {
         g_vdec = nullptr;
     }
 
-    if (play_fmt) {
-        avformat_close_input(&play_fmt);
-        play_fmt = nullptr;
-    }
+    close_play_fmt_safely();
 
     /* Paired with evo_stream_io_open() in startPlaybackSource(). After
      * avformat_close_input, so nothing is still reading through it. */
@@ -955,8 +969,7 @@ bool PlaybackController::startPlaybackSource(const PlaybackSource& source,
             EVO_LOGE("playback", "find_stream_info failed (rc=%d, timeout=%d) "
                    "and the header named no usable stream - giving up",
                    find_rc, probe_timed_out ? 1 : 0);
-            avformat_close_input(&play_fmt);
-            play_fmt = nullptr;
+            close_play_fmt_safely();
             evo_stream_io_close(m_streamIo);
             m_streamIo = nullptr;
             m_playbackFsm.postEvent(PlaybackEvent::Fail);
@@ -1334,8 +1347,7 @@ bool PlaybackController::startPlaybackSource(const PlaybackSource& source,
                          "decoder - /mnt/usb0/evo_no_sw_4k is set",
                          vp.width, vp.height);
             evo_mem_budget_log("sw-refuse");
-            avformat_close_input(&play_fmt);
-            play_fmt = nullptr;
+            close_play_fmt_safely();
             m_playbackFsm.postEvent(PlaybackEvent::Fail);
             toast("UNSUPPORTED", "4K software decode is switched off (evo_no_sw_4k)");
             return false;
@@ -1376,8 +1388,7 @@ bool PlaybackController::startPlaybackSource(const PlaybackSource& source,
                                   "native_pref_refused");
             evo_vdec_close(g_vdec);
             g_vdec = nullptr;
-            avformat_close_input(&play_fmt);
-            play_fmt = nullptr;
+            close_play_fmt_safely();
             m_playbackFsm.postEvent(PlaybackEvent::Fail);
             toast("UNSUPPORTED", "4K software decode is switched off (evo_no_sw_4k)");
             return false;

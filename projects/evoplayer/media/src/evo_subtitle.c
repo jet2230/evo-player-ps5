@@ -889,6 +889,17 @@ static void prospero_embedded_subtitle_extract_text(
 static char s_sample_cue_pool[2][PROSPERO_SAMPLE_POOL_SIZE][PROSPERO_EMBEDDED_SUBTITLE_TEXT_SIZE];
 static int s_sample_cue_count[2] = {0, 0};
 static pthread_mutex_t s_sample_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * FIX.md: the subtitle picker samples cues on the UI thread. While this flag
+ * is set, the cue getters below skip the fallback that re-opens the media
+ * file (extract_samples_from_file) - from the picker that open froze the app
+ * for seconds on a large local file, and a PGS track never fills the text
+ * ring so every DOWN press paid the whole open + scan. Set and cleared
+ * around one call (prospero_subtitle_preview_random_cues) on the UI thread,
+ * so a plain static is enough.
+ */
+static int s_preview_only = 0;
 /* Which film and track each pool was filled from. The pools were never
  * cleared, so the picker's preview showed lines from the previous film. */
 static char s_sample_pool_key[2][540];
@@ -3136,6 +3147,7 @@ int prospero_subtitle_get_cue_count(int is_secondary) {
             int scnt = s_sample_cue_count[1];
             pthread_mutex_unlock(&s_sample_pool_mutex);
             if (scnt > 0) return scnt;
+            if (s_preview_only) return 0;   /* picker: no UI-thread file re-open (FIX.md) */
             return prospero_subtitle_extract_samples_from_file(current_media_path, prospero_secondary_subtitle_stream_index, 1);
         }
         return 0;
@@ -3156,6 +3168,7 @@ int prospero_subtitle_get_cue_count(int is_secondary) {
         int scnt = s_sample_cue_count[0];
         pthread_mutex_unlock(&s_sample_pool_mutex);
         if (scnt > 0) return scnt;
+        if (s_preview_only) return 0;   /* picker: no UI-thread file re-open (FIX.md) */
         return prospero_subtitle_extract_samples_from_file(current_media_path, prospero_embedded_subtitle_stream_index, 0);
     }
     if (prospero_subtitle_count > 0) {
@@ -3267,6 +3280,20 @@ static int score_cue_length(const char *str) {
     } else {
         return 50 - dist;
     }
+}
+
+/*
+ * FIX.md: the subtitle picker samples on the UI thread; the flag lives with
+ * the sample pool above so the cue getters see it before their fallbacks.
+ */
+int prospero_subtitle_preview_random_cues(char *primary_out, size_t primary_sz,
+                                          char *secondary_out, size_t secondary_sz)
+{
+    s_preview_only = 1;
+    int rc = prospero_subtitle_sample_random_cues(primary_out, primary_sz,
+                                                  secondary_out, secondary_sz);
+    s_preview_only = 0;
+    return rc;
 }
 
 int prospero_subtitle_sample_random_cues(char *primary_out, size_t primary_sz,

@@ -1,5 +1,6 @@
 #include "evo/screens/PlayerScreen.hpp"
 #include "evo/Application.hpp"
+#include "evo/PlayFmtLock.hpp"
 #include "evo/services/NetworkStorageService.hpp"
 #include "evo/screens/ProviderHostScreen.hpp"
 #include "evo_provider.h"
@@ -713,28 +714,33 @@ void PlayerScreen::feedPerformanceHud() {
     const char *hdrName = "SDR";
     int vw = 0, vh = 0, ach = 0, arate = detected_audio_rate;
 
-    if (play_fmt && video_stream_index >= 0 && video_stream_index < (int)play_fmt->nb_streams) {
-        AVCodecParameters *cp = play_fmt->streams[video_stream_index]->codecpar;
-        if (cp) {
-            std::snprintf(vcodec, sizeof(vcodec), "%s", avcodec_get_name(cp->codec_id));
-            vw = cp->width;
-            vh = cp->height;
-            if (evo_dovi_stream_profile(cp) > 0)                hdrName = "DOLBY VISION";
-            else if (cp->color_trc == AVCOL_TRC_SMPTE2084)      hdrName = "HDR10";
-            else if (cp->color_trc == AVCOL_TRC_ARIB_STD_B67)   hdrName = "HLG";
-        }
-    }
-    if (play_fmt && audio_stream_index >= 0 && audio_stream_index < (int)play_fmt->nb_streams) {
-        AVStream *st = play_fmt->streams[audio_stream_index];
-        if (st && st->codecpar) {
-            std::snprintf(acodec, sizeof(acodec), "%s", avcodec_get_name(st->codecpar->codec_id));
-            ach = st->codecpar->ch_layout.nb_channels;
-            arate = st->codecpar->sample_rate;
-            const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", nullptr, 0);
-            if (lang && lang->value && lang->value[0]) {
-                std::snprintf(alang, sizeof(alang), "%s", lang->value);
+    /* FIX.md: play_fmt is closed on playback worker threads; walk it under
+     * the lock. Each local shadows the global for its block. */
+    if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+        if (video_stream_index >= 0 && video_stream_index < (int)play_fmt->nb_streams) {
+            AVCodecParameters *cp = play_fmt->streams[video_stream_index]->codecpar;
+            if (cp) {
+                std::snprintf(vcodec, sizeof(vcodec), "%s", avcodec_get_name(cp->codec_id));
+                vw = cp->width;
+                vh = cp->height;
+                if (evo_dovi_stream_profile(cp) > 0)                hdrName = "DOLBY VISION";
+                else if (cp->color_trc == AVCOL_TRC_SMPTE2084)      hdrName = "HDR10";
+                else if (cp->color_trc == AVCOL_TRC_ARIB_STD_B67)   hdrName = "HLG";
             }
         }
+        if (audio_stream_index >= 0 && audio_stream_index < (int)play_fmt->nb_streams) {
+            AVStream *st = play_fmt->streams[audio_stream_index];
+            if (st && st->codecpar) {
+                std::snprintf(acodec, sizeof(acodec), "%s", avcodec_get_name(st->codecpar->codec_id));
+                ach = st->codecpar->ch_layout.nb_channels;
+                arate = st->codecpar->sample_rate;
+                const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", nullptr, 0);
+                if (lang && lang->value && lang->value[0]) {
+                    std::snprintf(alang, sizeof(alang), "%s", lang->value);
+                }
+            }
+        }
+        evo_play_fmt_release();
     }
 
     const char *backend = (evo_pb_active_backend() == EVO_VDEC_BACKEND_NATIVE)
@@ -760,16 +766,19 @@ void PlayerScreen::feedPerformanceHud() {
     /* Container and where it plays from: the demuxer's first name ("mov,mp4,..." reads
      * as MP4), then the provider, or LOCAL FILE. */
     char container[24] = "?";
-    if (play_fmt && play_fmt->iformat && play_fmt->iformat->name) {
-        const char *n = play_fmt->iformat->name;
-        if (std::strstr(n, "mp4")) {
-            std::snprintf(container, sizeof(container), "MP4");
-        } else {
-            std::snprintf(container, sizeof(container), "%.*s",
-                          static_cast<int>(std::strcspn(n, ",")), n);
-            for (char *c = container; *c; ++c)
-                if (*c >= 'a' && *c <= 'z') *c = static_cast<char>(*c - 'a' + 'A');
+    if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+        if (play_fmt->iformat && play_fmt->iformat->name) {
+            const char *n = play_fmt->iformat->name;
+            if (std::strstr(n, "mp4")) {
+                std::snprintf(container, sizeof(container), "MP4");
+            } else {
+                std::snprintf(container, sizeof(container), "%.*s",
+                              static_cast<int>(std::strcspn(n, ",")), n);
+                for (char *c = container; *c; ++c)
+                    if (*c >= 'a' && *c <= 'z') *c = static_cast<char>(*c - 'a' + 'A');
+            }
         }
+        evo_play_fmt_release();
     }
     char where[48] = "LOCAL FILE";
     if (auto pb = Application::getInstance().getPlaybackController()) {
@@ -926,31 +935,36 @@ void PlayerScreen::render(uint32_t* framebuffer, int width, int height) {
         const char* hdrBadge = "";
         resBuf[0] = codecBuf[0] = fpsBuf[0] = '\0';
 
-        if (play_fmt && video_stream_index >= 0 &&
-            video_stream_index < static_cast<int>(play_fmt->nb_streams)) {
-            AVCodecParameters* cp = play_fmt->streams[video_stream_index]->codecpar;
-            if (cp) {
-                int vh = cp->height, vw = cp->width;
-                if (vh >= 2000)      std::snprintf(resBuf, sizeof(resBuf), "4K UHD");
-                else if (vh >= 1400) std::snprintf(resBuf, sizeof(resBuf), "1440p QHD");
-                else if (vh >= 1000) std::snprintf(resBuf, sizeof(resBuf), "1080p FHD");
-                else if (vh >= 700)  std::snprintf(resBuf, sizeof(resBuf), "720p HD");
-                else if (vh > 0)     std::snprintf(resBuf, sizeof(resBuf), "%dx%d", vw, vh);
+        /* FIX.md: play_fmt is closed on playback worker threads; walk it under
+         * the lock. The local shadows the global for the block's body. */
+        if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+            if (video_stream_index >= 0 &&
+                video_stream_index < static_cast<int>(play_fmt->nb_streams)) {
+                AVCodecParameters* cp = play_fmt->streams[video_stream_index]->codecpar;
+                if (cp) {
+                    int vh = cp->height, vw = cp->width;
+                    if (vh >= 2000)      std::snprintf(resBuf, sizeof(resBuf), "4K UHD");
+                    else if (vh >= 1400) std::snprintf(resBuf, sizeof(resBuf), "1440p QHD");
+                    else if (vh >= 1000) std::snprintf(resBuf, sizeof(resBuf), "1080p FHD");
+                    else if (vh >= 700)  std::snprintf(resBuf, sizeof(resBuf), "720p HD");
+                    else if (vh > 0)     std::snprintf(resBuf, sizeof(resBuf), "%dx%d", vw, vh);
 
-                const char* cn = avcodec_get_name(cp->codec_id);
-                switch (cp->codec_id) {
-                    case AV_CODEC_ID_H264: cn = "H.264 / AVC";  break;
-                    case AV_CODEC_ID_HEVC: cn = "H.265 / HEVC"; break;
-                    case AV_CODEC_ID_VP9:  cn = "VP9";          break;
-                    case AV_CODEC_ID_AV1:  cn = "AV1";          break;
-                    default: break;
+                    const char* cn = avcodec_get_name(cp->codec_id);
+                    switch (cp->codec_id) {
+                        case AV_CODEC_ID_H264: cn = "H.264 / AVC";  break;
+                        case AV_CODEC_ID_HEVC: cn = "H.265 / HEVC"; break;
+                        case AV_CODEC_ID_VP9:  cn = "VP9";          break;
+                        case AV_CODEC_ID_AV1:  cn = "AV1";          break;
+                        default: break;
+                    }
+                    std::snprintf(codecBuf, sizeof(codecBuf), "%s", cn);
+
+                    if (evo_dovi_stream_profile(cp) > 0)          hdrBadge = "DOLBY VISION";
+                    else if (cp->color_trc == AVCOL_TRC_SMPTE2084) hdrBadge = "HDR10";
+                    else if (cp->color_trc == AVCOL_TRC_ARIB_STD_B67) hdrBadge = "HLG";
                 }
-                std::snprintf(codecBuf, sizeof(codecBuf), "%s", cn);
-
-                if (evo_dovi_stream_profile(cp) > 0)          hdrBadge = "DOLBY VISION";
-                else if (cp->color_trc == AVCOL_TRC_SMPTE2084) hdrBadge = "HDR10";
-                else if (cp->color_trc == AVCOL_TRC_ARIB_STD_B67) hdrBadge = "HLG";
             }
+            evo_play_fmt_release();
         }
 
         double fps = evo_pb_video_fps();
@@ -976,32 +990,38 @@ void PlayerScreen::render(uint32_t* framebuffer, int width, int height) {
         audioTrackBuf[0] = subTrackBuf[0] = '\0';
         const char* chLabel = "";
 
-        if (play_fmt && audio_stream_index >= 0 &&
-            audio_stream_index < static_cast<int>(play_fmt->nb_streams)) {
-            AVStream* ast = play_fmt->streams[audio_stream_index];
-            if (ast && ast->codecpar) {
-                const int ch = ast->codecpar->ch_layout.nb_channels;
-                chLabel = (ch >= 8) ? "7.1" : (ch >= 6) ? "5.1"
-                        : (ch == 2) ? "Stereo" : (ch == 1) ? "Mono" : "";
-                const char* an = avcodec_get_name(ast->codecpar->codec_id);
-                if (chLabel[0] && an && an[0])
-                    std::snprintf(audioTrackBuf, sizeof(audioTrackBuf), "%s %s", an, chLabel);
-                else if (an && an[0])
-                    std::snprintf(audioTrackBuf, sizeof(audioTrackBuf), "%s", an);
+        if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+            if (audio_stream_index >= 0 &&
+                audio_stream_index < static_cast<int>(play_fmt->nb_streams)) {
+                AVStream* ast = play_fmt->streams[audio_stream_index];
+                if (ast && ast->codecpar) {
+                    const int ch = ast->codecpar->ch_layout.nb_channels;
+                    chLabel = (ch >= 8) ? "7.1" : (ch >= 6) ? "5.1"
+                            : (ch == 2) ? "Stereo" : (ch == 1) ? "Mono" : "";
+                    const char* an = avcodec_get_name(ast->codecpar->codec_id);
+                    if (chLabel[0] && an && an[0])
+                        std::snprintf(audioTrackBuf, sizeof(audioTrackBuf), "%s %s", an, chLabel);
+                    else if (an && an[0])
+                        std::snprintf(audioTrackBuf, sizeof(audioTrackBuf), "%s", an);
+                }
             }
+            evo_play_fmt_release();
         }
 
         if (prospero_subtitle_enabled) {
             if (prospero_subtitle_use_external) {
                 std::snprintf(subTrackBuf, sizeof(subTrackBuf), "External SRT");
-            } else if (play_fmt && prospero_embedded_subtitle_stream_index >= 0 &&
-                       prospero_embedded_subtitle_stream_index <
-                           static_cast<int>(play_fmt->nb_streams)) {
-                AVStream* sst = play_fmt->streams[prospero_embedded_subtitle_stream_index];
-                const AVDictionaryEntry* lang =
-                    sst ? av_dict_get(sst->metadata, "language", nullptr, 0) : nullptr;
-                std::snprintf(subTrackBuf, sizeof(subTrackBuf), "%s",
-                              (lang && lang->value && lang->value[0]) ? lang->value : "On");
+            } else if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+                if (prospero_embedded_subtitle_stream_index >= 0 &&
+                    prospero_embedded_subtitle_stream_index <
+                        static_cast<int>(play_fmt->nb_streams)) {
+                    AVStream* sst = play_fmt->streams[prospero_embedded_subtitle_stream_index];
+                    const AVDictionaryEntry* lang =
+                        sst ? av_dict_get(sst->metadata, "language", nullptr, 0) : nullptr;
+                    std::snprintf(subTrackBuf, sizeof(subTrackBuf), "%s",
+                                  (lang && lang->value && lang->value[0]) ? lang->value : "On");
+                }
+                evo_play_fmt_release();
             }
             /* Enabled but nothing to show (no external file, no embedded
              * track): leave it empty, so the OSD says None - and hides SUBS
@@ -1011,13 +1031,18 @@ void PlayerScreen::render(uint32_t* framebuffer, int width, int height) {
         // #110: name the secondary track next to the primary's.
         if (prospero_subtitle_enabled && prospero_secondary_subtitle_active()) {
             const char* second = "SRT";
-            if (!prospero_secondary_use_external && play_fmt &&
-                prospero_secondary_subtitle_stream_index >= 0 &&
-                prospero_secondary_subtitle_stream_index < static_cast<int>(play_fmt->nb_streams)) {
-                AVStream* s2 = play_fmt->streams[prospero_secondary_subtitle_stream_index];
-                const AVDictionaryEntry* l2 =
-                    s2 ? av_dict_get(s2->metadata, "language", nullptr, 0) : nullptr;
-                second = (l2 && l2->value && l2->value[0]) ? l2->value : "2nd";
+            if (!prospero_secondary_use_external) {
+                if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+                    if (prospero_secondary_subtitle_stream_index >= 0 &&
+                        prospero_secondary_subtitle_stream_index <
+                            static_cast<int>(play_fmt->nb_streams)) {
+                        AVStream* s2 = play_fmt->streams[prospero_secondary_subtitle_stream_index];
+                        const AVDictionaryEntry* l2 =
+                            s2 ? av_dict_get(s2->metadata, "language", nullptr, 0) : nullptr;
+                        second = (l2 && l2->value && l2->value[0]) ? l2->value : "2nd";
+                    }
+                    evo_play_fmt_release();
+                }
             }
             const size_t used = std::strlen(subTrackBuf);
             std::snprintf(subTrackBuf + used, sizeof(subTrackBuf) - used,

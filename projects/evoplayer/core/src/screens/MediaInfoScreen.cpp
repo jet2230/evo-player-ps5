@@ -1,5 +1,6 @@
 #include "evo/screens/MediaInfoScreen.hpp"
 #include "evo/Application.hpp"
+#include "evo/PlayFmtLock.hpp"
 #include "evo_rmlui_bridge.h"
 #include "evo_feedback.h"
 #include "evo_recent.h"
@@ -64,7 +65,11 @@ void MediaInfoScreen::render(uint32_t* framebuffer, int width, int height) {
     auto playback = Application::getInstance().getPlaybackController();
     if (!metaService || !playback) return;
 
-    auto meta = metaService->extractMetadataFromFormat(play_fmt, playback->getCurrentFilePath());
+    /* FIX.md: play_fmt is closed on playback worker threads; hold the lock
+     * while the metadata service reads it. */
+    AVFormatContext* locked_fmt = evo_play_fmt_acquire();
+    auto meta = metaService->extractMetadataFromFormat(locked_fmt, playback->getCurrentFilePath());
+    evo_play_fmt_release();
 
     evo_rmlui_mediainfo_params_t params;
     std::memset(&params, 0, sizeof(params));
@@ -129,13 +134,16 @@ void MediaInfoScreen::render(uint32_t* framebuffer, int width, int height) {
          * when there is no stream to ask.
          */
         int vc_trc = evo_vdec_ffmpeg_color_trc(g_vdec);
-        if (play_fmt && video_stream_index >= 0 &&
-            video_stream_index < static_cast<int>(play_fmt->nb_streams)) {
-            if (AVCodecParameters* vcp =
-                    play_fmt->streams[video_stream_index]->codecpar) {
-                if (vcp->color_trc != AVCOL_TRC_UNSPECIFIED)
-                    vc_trc = (int)vcp->color_trc;
+        if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+            if (video_stream_index >= 0 &&
+                video_stream_index < static_cast<int>(play_fmt->nb_streams)) {
+                if (AVCodecParameters* vcp =
+                        play_fmt->streams[video_stream_index]->codecpar) {
+                    if (vcp->color_trc != AVCOL_TRC_UNSPECIFIED)
+                        vc_trc = (int)vcp->color_trc;
+                }
             }
+            evo_play_fmt_release();
         }
         int vc_pf = evo_vdec_ffmpeg_pix_fmt(g_vdec);
         bool is_10bit = (vc_pf == AV_PIX_FMT_YUV420P10LE ||

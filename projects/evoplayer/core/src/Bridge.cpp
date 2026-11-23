@@ -21,6 +21,7 @@
 #include "evo/services/NetworkStorageService.hpp"
 
 #include <cstring>
+#include <pthread.h>
 
 namespace evo {
 /* Startup default; evo::Application::initialize() replaces these with what
@@ -51,6 +52,36 @@ int evo_audio_channels = 2;
 
 AVFormatContext *play_fmt = nullptr;
 AVCodecContext *audio_ctx = nullptr;
+
+/*
+ * play_fmt is torn down on playback worker threads (provider auto-next, the
+ * web/cast handoff worker) as well as the UI thread, while UI screens walk it
+ * - the subtitle picker reads nb_streams/streams[] when DOWN opens it. A walk
+ * that overlaps a teardown read a freed context and took the app down.
+ *
+ * One mutex makes that impossible. Readers hold it only across a memory-only
+ * walk (av_dict_get / avcodec_get_name - microseconds). Teardown swaps the
+ * pointer out under the lock and closes the old context OUTSIDE it, because
+ * avformat_close_input can block on network I/O and the UI must never wait
+ * on that. See FIX.md.
+ */
+static pthread_mutex_t g_play_fmt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+AVFormatContext *evo_play_fmt_acquire(void) {
+    pthread_mutex_lock(&g_play_fmt_mutex);
+    return play_fmt;
+}
+
+void evo_play_fmt_release(void) {
+    pthread_mutex_unlock(&g_play_fmt_mutex);
+}
+
+void evo_play_fmt_swap_out(AVFormatContext **out) {
+    pthread_mutex_lock(&g_play_fmt_mutex);
+    *out = play_fmt;
+    play_fmt = nullptr;
+    pthread_mutex_unlock(&g_play_fmt_mutex);
+}
 evo_vdec *g_vdec = nullptr;
 int g_vdec_force_ffmpeg = 0;
 AVPacket *video_pending_pkt = nullptr;

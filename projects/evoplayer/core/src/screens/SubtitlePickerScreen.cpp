@@ -1,5 +1,6 @@
 #include "evo/screens/SubtitlePickerScreen.hpp"
 #include "evo/Application.hpp"
+#include "evo/PlayFmtLock.hpp"
 #include "evo_subtitle.h"
 #include "evo_langname.h"
 #include "evo_subsync.h"
@@ -68,9 +69,16 @@ void SubtitlePickerScreen::refreshTracks() {
     }
 
     // 3. Embedded subtitle streams
-    if (play_fmt) {
-        for (unsigned int i = 0; i < play_fmt->nb_streams; ++i) {
-            AVStream* stream = play_fmt->streams[i];
+    /*
+     * FIX.md: the context is closed on the playback worker threads (provider
+     * auto-next, web/cast handoff). Hold the play_fmt lock across the walk so
+     * it cannot be freed under us; the walk is memory-only, so the critical
+     * section is microseconds and the worker's close never blocks behind it
+     * for long. The pointer goes null mid-teardown - no tracks, no crash.
+     */
+    if (AVFormatContext* fmt = evo_play_fmt_acquire()) {
+        for (unsigned int i = 0; i < fmt->nb_streams; ++i) {
+            AVStream* stream = fmt->streams[i];
             if (!stream || !stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
                 continue;
             }
@@ -124,6 +132,7 @@ void SubtitlePickerScreen::refreshTracks() {
 
             m_tracks.push_back(std::move(streamTrack));
         }
+        evo_play_fmt_release();
     }
 
     // 4. Online subtitles from the Stremio addons for this title (not yet loaded)
@@ -248,11 +257,21 @@ void SubtitlePickerScreen::activateSelection() {
         // Off
         prospero_subtitle_enabled = 0;
         toast("SUBTITLES", "OFF");
-    } else if (!prospero_subtitle_select_primary(trackId)) {
-        evo_feedback(EVO_FB_ERROR);
-        return;
-    } else if (trackId == -1) {
-        toast("SUBTITLES", "EXTERNAL SRT");
+    } else {
+        /* FIX.md: the select path reads play_fmt; hold the lock so a worker
+         * teardown cannot free it mid-select. Null (teardown in flight)
+         * simply skips the switch. */
+        if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+            const bool ok = prospero_subtitle_select_primary(trackId) != 0;
+            evo_play_fmt_release();
+            if (!ok) {
+                evo_feedback(EVO_FB_ERROR);
+                return;
+            }
+            if (trackId == -1) {
+                toast("SUBTITLES", "EXTERNAL SRT");
+            }
+        }
     }
     // An embedded track toasts its own language and codec as it opens.
 
@@ -286,9 +305,16 @@ void SubtitlePickerScreen::activateSecondary() {
             return;
         }
         prospero_secondary_subtitle_select(PROSPERO_SECONDARY_NONE);
-    } else if (!prospero_secondary_subtitle_select(entry.trackId)) {
-        evo_feedback(EVO_FB_ERROR);     // it toasted why
-        return;
+    } else {
+        /* FIX.md: the select path reads play_fmt; hold the lock across it. */
+        if (AVFormatContext* play_fmt = evo_play_fmt_acquire()) {
+            const bool ok = prospero_secondary_subtitle_select(entry.trackId) != 0;
+            evo_play_fmt_release();
+            if (!ok) {
+                evo_feedback(EVO_FB_ERROR);     // it toasted why
+                return;
+            }
+        }
     }
 
     evo_feedback(EVO_FB_CONFIRM);
@@ -322,7 +348,11 @@ void SubtitlePickerScreen::cycleSecondarySize() {
 void SubtitlePickerScreen::rollRandomCues() {
     char pBuf[PROSPERO_EMBEDDED_SUBTITLE_TEXT_SIZE] = {0};
     char sBuf[PROSPERO_EMBEDDED_SUBTITLE_TEXT_SIZE] = {0};
-    prospero_subtitle_sample_random_cues(pBuf, sizeof(pBuf), sBuf, sizeof(sBuf));
+    /* FIX.md: the preview must never re-open the file on the UI thread (a
+     * large local MKV stalled the picker for seconds; a PGS track never fills
+     * the text ring, so every open paid it). The preview variant samples only
+     * cues already decoded or pooled. */
+    prospero_subtitle_preview_random_cues(pBuf, sizeof(pBuf), sBuf, sizeof(sBuf));
     m_previewPrimary = pBuf;
     m_previewSecondary = sBuf;
 }
