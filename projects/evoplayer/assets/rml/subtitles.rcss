@@ -301,6 +301,12 @@ div, span, p {
     opacity: 0.45;
 }
 
+/* DELETE MODE: rows EVO can delete are shown in red */
+.row-danger {
+    color: #ff7b7b;
+    border-color: #ff7b7b;
+}
+
 .badge-hidden {
     display: none;
 }

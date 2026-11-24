@@ -8,10 +8,15 @@
 #include "evo_feedback.h"
 #include "evo_toast.h"
 #include "evo_online_subs.h"
+#include "evo_websub.h"
+#include "evo_keyboard.h"
+
+#include <algorithm>
 
 extern "C" {
 #include <libavformat/avformat.h>
 extern AVFormatContext *play_fmt;
+extern char current_media_path[768];
 }
 
 #include <cstdio>
@@ -27,7 +32,16 @@ SubtitlePickerScreen::SubtitlePickerScreen()
 
 void SubtitlePickerScreen::onEnter() {
     StatefulScreen::onEnter();
+    /* docs/planning/websubs.md: the web search does NOT start on open - the
+     * SEARCH ONLINE... row starts it, so the picker opens instantly and no
+     * request goes out until the user asks for one. */
     refreshTracks();
+    m_lastWebStatus = evo_websub_status();
+    /* seed the external-state cache: an already-loaded subtitle on open is
+     * not news, so no LOADED toast until something new lands */
+    m_seenExtCount = prospero_subtitle_count;
+    m_seenExtActive = prospero_subtitle_enabled && prospero_subtitle_use_external;
+    std::snprintf(m_seenExtLabel, sizeof m_seenExtLabel, "%s", prospero_subtitle_external_label);
     m_selectedIndex = m_activeTrackIndex;
     m_scrollOffset = 0;
     if (m_selectedIndex >= kVisibleRows) {
@@ -38,6 +52,9 @@ void SubtitlePickerScreen::onEnter() {
 
 void SubtitlePickerScreen::onExit() {
     StatefulScreen::onExit();
+    m_deleteMode = false;
+    m_r2HoldMs = 0;
+    m_r2Held = false;
 }
 
 void SubtitlePickerScreen::refreshTracks() {
@@ -51,8 +68,31 @@ void SubtitlePickerScreen::refreshTracks() {
     offTrack.detail = "Disable subtitles";
     m_tracks.push_back(std::move(offTrack));
 
+    // 2b. Multiple sidecars next to the movie (downloaded .en.srt, .sq.srt,
+    // .en.2.srt...): one row each so the user picks which is active. Only
+    // when there is more than one - with a single file the plain EXTERNAL
+    // row below stays the simple case.
+    {
+        char scp[kMaxExtSidecars][768];
+        char scn[kMaxExtSidecars][64];
+        const int nsc = evo_websub_sidecars(scp, scn, kMaxExtSidecars);
+        if (nsc > 1) {
+            for (int i = 0; i < nsc; ++i) {
+                SubtitleTrackEntry row;
+                row.trackId = kExtSidecarBase - i;
+                row.label = std::string("EXTERNAL · ") + scn[i];
+                row.detail = "EXTERNAL SRT FILE NEXT TO THE MOVIE";
+                row.extPath = scp[i];
+                m_tracks.push_back(std::move(row));
+            }
+            m_extSidecarCount = nsc;
+        } else {
+            m_extSidecarCount = 0;
+        }
+    }
+
     // 2. External SRT if available (a sidecar, a media server's, or an online one)
-    if (prospero_subtitle_count > 0) {
+    if (prospero_subtitle_count > 0 && m_extSidecarCount == 0) {
         SubtitleTrackEntry extTrack;
         extTrack.trackId = -1;
         extTrack.label = prospero_subtitle_external_label[0] ? prospero_subtitle_external_label
@@ -161,6 +201,56 @@ void SubtitlePickerScreen::refreshTracks() {
         }
     }
 
+    // 4b. Subtitle websites (docs/planning/websubs.md): idle until the user
+    // presses SEARCH ONLINE...; then a live stage row (which site is being
+    // asked, seconds elapsed), then the results - or a plain "nothing" row.
+    // Results are tagged with the file they were searched for: another
+    // movie's rows must never show here.
+    {
+        const char *owner = evo_websub_owner();
+        const bool mine = owner[0] && current_media_path[0] &&
+                          strcmp(owner, current_media_path) == 0;
+        const int wstatus = mine ? evo_websub_status() : 0;
+        if (wstatus == 1) {
+            SubtitleTrackEntry row;
+            row.trackId = kWebSearchTrack;
+            row.label = "SEARCHING WEB SITES...";
+            row.detail = evo_websub_stage();
+            m_tracks.push_back(std::move(row));
+        } else if (wstatus == 3) {
+            SubtitleTrackEntry row;
+            row.trackId = kWebSearchTrack;
+            row.label = "NO SUBS FOUND";
+            row.detail = evo_websub_stage();
+            m_tracks.push_back(std::move(row));
+            SubtitleTrackEntry searchRow;
+            searchRow.trackId = kWebSearchTrack;
+            searchRow.label = "TRY SEARCHING AGAIN...";
+            searchRow.detail = "ASK THE WEB SITES ONCE MORE";
+            m_tracks.push_back(std::move(searchRow));
+        } else {
+            const int n = evo_websub_results_count();
+            for (int i = 0; i < n && i < kMaxWebRows; ++i) {
+                evo_websub_result_t r;
+                if (!evo_websub_results_get(i, &r)) continue;
+                SubtitleTrackEntry row;
+                row.trackId = kWebSubBase - i;
+                row.label = r.label;
+                row.detail = std::string("WEB · ") + r.site +
+                             (r.lang_tag[0] ? std::string(" · ") + r.lang_tag : std::string());
+                if (evo_websub_is_downloaded(i))
+                    row.detail += " · ON DISK";
+                m_tracks.push_back(std::move(row));
+            }
+            SubtitleTrackEntry searchRow;
+            searchRow.trackId = kWebSearchTrack;
+            searchRow.label = "SEARCH ONLINE...";
+            searchRow.detail = n > 0 ? "SEARCH THE WEB SITES AGAIN"
+                                     : "SEARCH PODNAPISI, OPENSUBTITLES AND SUBDL";
+            m_tracks.push_back(std::move(searchRow));
+        }
+    }
+
     // AUTO-SYNC (#102): matches the active track - external SRT or an
     // embedded text track - to the audio. Second row, so a long track list
     // never scrolls it away. Its detail is live (progress); render() fills it.
@@ -219,6 +309,61 @@ void SubtitlePickerScreen::activateSelection() {
     }
 
     int trackId = m_tracks[m_selectedIndex].trackId;
+
+    if (trackId <= kExtSidecarBase && trackId > kExtSidecarBase - kMaxExtSidecars) {
+        /* pick this sidecar as the active external subtitle */
+        const std::string &path = m_tracks[m_selectedIndex].extPath;
+        evo_feedback(EVO_FB_CONFIRM);
+        if (!prospero_subtitle_load_file_quiet(path.c_str()) ||
+            !prospero_subtitle_select_primary(-1)) {
+            evo_feedback(EVO_FB_ERROR);
+            toast("SUBTITLES", "COULD NOT LOAD THAT FILE");
+            return;
+        }
+        std::snprintf(prospero_subtitle_external_label,
+                      sizeof prospero_subtitle_external_label, "%s",
+                      m_tracks[m_selectedIndex].label.c_str());
+        prospero_subtitle_use_external = 1;
+        prospero_subtitle_enabled = 1;
+        toast("SUBTITLES", "EXTERNAL SRT SET");
+        refreshTracks();
+        return;
+    }
+
+    if (trackId == kWebSearchTrack) {
+        evo_feedback(EVO_FB_OPEN);
+        /* A local file: search the web sites for it right now (the hash and
+         * the parsed name come from the file). No local path (a provider
+         * stream): fall back to typing a name. */
+        if (current_media_path[0]) {
+            if (evo_websub_begin_search(current_media_path) != 0) {
+                toast("SUBTITLES", "A SEARCH IS ALREADY RUNNING");
+                return;
+            }
+            m_lastWebStatus = 1;
+            refreshTracks();
+            toast("SUBTITLES", "SEARCHING...");
+        } else {
+            evo_keyboard_open("SEARCH SUBTITLES ONLINE", "", 96,
+                              &SubtitlePickerScreen::OnWebSearchSubmitted, this);
+        }
+        return;
+    }
+
+    if (trackId <= kWebSubBase) {
+        /* docs/planning/websubs.md: the download runs off-thread and the
+         * player loads it via evo_websub_take_ready when it lands, so the
+         * picker never blocks. */
+        evo_feedback(EVO_FB_CONFIRM);
+        const int idx = kWebSubBase - trackId;
+        if (evo_websub_fetch_async(idx) != 0) {
+            evo_feedback(EVO_FB_ERROR);
+            toast("SUBTITLES", "A DOWNLOAD IS ALREADY RUNNING");
+            return;
+        }
+        toast("SUBTITLES", "DOWNLOADING...");
+        return;
+    }
 
     if (trackId == kLoadFileTrack) {
         evo_feedback(EVO_FB_OPEN);
@@ -345,6 +490,21 @@ void SubtitlePickerScreen::cycleSecondarySize() {
     evo_feedback(EVO_FB_MOVE);
 }
 
+/* The keyboard's submit runs on the main thread (evo_keyboard.h). Re-run the
+ * search with the typed text and stay on the picker to watch it land. */
+void SubtitlePickerScreen::OnWebSearchSubmitted(const char *text, void *userdata) {
+    auto *self = static_cast<SubtitlePickerScreen *>(userdata);
+    if (!self || !text || !text[0]) return;
+    if (evo_websub_search_query(text) != 0) {
+        toast("SUBTITLES", "A SEARCH IS ALREADY RUNNING");
+        return;
+    }
+    self->refreshTracks();
+    self->m_selectedIndex = 0;
+    self->m_scrollOffset = 0;
+    toast("SUBTITLES", "SEARCHING...");
+}
+
 void SubtitlePickerScreen::rollRandomCues() {
     char pBuf[PROSPERO_EMBEDDED_SUBTITLE_TEXT_SIZE] = {0};
     char sBuf[PROSPERO_EMBEDDED_SUBTITLE_TEXT_SIZE] = {0};
@@ -358,8 +518,42 @@ void SubtitlePickerScreen::rollRandomCues() {
 }
 
 bool SubtitlePickerScreen::handleInput(uint32_t pressed, uint32_t held, uint32_t released) {
-    (void)held;
     (void)released;
+
+    /* DELETE MODE (hold R2 ~3 s): Up/Down still pick the row, Cross deletes
+     * the loaded subtitle, Circle (or a new R2 tap) leaves the mode. */
+    if (m_deleteMode) {
+        if (pressed & PadButtons::Up) {
+            navigate(-1);
+            return true;
+        }
+        if (pressed & PadButtons::Down) {
+            navigate(1);
+            return true;
+        }
+        if (pressed & PadButtons::Cross) {
+            deleteFocusedSubtitle();
+            return true;
+        }
+        if (pressed & PadButtons::Circle) {
+            m_deleteMode = false;
+            evo_feedback(EVO_FB_CANCEL);
+            toast("SUBTITLES", "DELETE MODE OFF");
+            return true;
+        }
+        if (pressed & PadButtons::R2) {
+            m_deleteMode = false;
+            evo_feedback(EVO_FB_CANCEL);
+            toast("SUBTITLES", "DELETE MODE OFF");
+            return true;
+        }
+        return true;
+    }
+
+    /* hold detection runs on the held mask; update() accumulates time */
+    m_r2Held = (held & PadButtons::R2) != 0;
+    if (pressed & PadButtons::R2)
+        m_r2HoldMs = 0;
 
     if (pressed & PadButtons::Up) {
         navigate(-1);
@@ -424,8 +618,164 @@ bool SubtitlePickerScreen::handleInput(uint32_t pressed, uint32_t held, uint32_t
     return false;
 }
 
+/* DELETE MODE list: every subtitle EVO downloaded for this movie (sidecars
+ * next to the file, plus a data-dir pick when the movie folder was
+ * read-only). The user's own sidecars from elsewhere are never listed. */
+void SubtitlePickerScreen::rebuildDeleteList() {
+    m_delList.clear();
+    char scp[kMaxExtSidecars][768];
+    char scn[kMaxExtSidecars][64];
+    const int nsc = evo_websub_sidecars(scp, scn, kMaxExtSidecars);
+    for (int i = 0; i < nsc; ++i) {
+        if (!evo_websub_is_our_file(scp[i])) continue;
+        DeleteRow r;
+        r.path = scp[i];
+        r.name = scn[i];
+        m_delList.push_back(std::move(r));
+    }
+    /* a data-dir pick (movie folder was read-only) is not a sidecar */
+    const char *loaded = prospero_subtitle_external_path();
+    if (loaded[0]) {
+        const char *root = "/data/evoplayer/";
+        if (strncmp(loaded, root, strlen(root)) == 0 &&
+            std::none_of(m_delList.begin(), m_delList.end(),
+                         [&](const DeleteRow &r) { return r.path == loaded; })) {
+            DeleteRow r;
+            r.path = loaded;
+            r.name = "downloaded";
+            m_delList.push_back(std::move(r));
+        }
+    }
+}
+
+/* DELETE MODE: Cross unloads/deletes the focused downloaded subtitle. */
+void SubtitlePickerScreen::deleteFocusedSubtitle() {
+    if (m_selectedIndex < 0 || m_selectedIndex >= static_cast<int>(m_delList.size())) {
+        evo_feedback(EVO_FB_ERROR);
+        return;
+    }
+    const std::string path = m_delList[m_selectedIndex].path;
+    const bool loaded = path == prospero_subtitle_external_path();
+    if (loaded) {
+        if (!prospero_subtitle_external_delete()) {
+            evo_feedback(EVO_FB_ERROR);
+            toast("SUBTITLES", "NOTHING LOADED TO DELETE");
+            return;
+        }
+    } else if (remove(path.c_str()) != 0) {
+        evo_feedback(EVO_FB_ERROR);
+        toast("SUBTITLES", "COULD NOT DELETE THE FILE");
+        return;
+    }
+    evo_feedback(EVO_FB_CONFIRM);
+    toast("SUBTITLES", "SUBTITLES DELETED");
+    rebuildDeleteList();
+    if (m_delList.empty()) {
+        m_deleteMode = false;
+        toast("SUBTITLES", "DELETE MODE OFF - NOTHING MORE TO DELETE");
+    }
+    if (m_selectedIndex >= static_cast<int>(m_delList.size()))
+        m_selectedIndex = static_cast<int>(m_delList.size()) - 1;
+    if (m_selectedIndex < 0) m_selectedIndex = 0;
+    refreshTracks();
+}
+
 void SubtitlePickerScreen::update(double deltaMs) {
     StatefulScreen::update(deltaMs);
+
+    /* DELETE MODE trigger: R2 held ~3 s. handleInput sets m_r2Held from the
+     * held mask every frame; this accumulates the time. */
+    if (m_r2Held) {
+        m_r2HoldMs += static_cast<int>(deltaMs);
+        if (m_r2HoldMs >= 3000) {
+            m_r2HoldMs = 0;
+            m_r2Held = false;
+            rebuildDeleteList();
+            if (m_delList.empty()) {
+                evo_feedback(EVO_FB_ERROR);
+                toast("SUBTITLES", "NO DOWNLOADED SUBS TO DELETE");
+            } else {
+                m_deleteMode = true;
+                m_selectedIndex = 0;
+                evo_feedback(EVO_FB_OPEN);
+                char msg[96];
+                std::snprintf(msg, sizeof msg,
+                              "DELETE MODE - %d TO DELETE, CROSS DELETES, CIRCLE CANCELS",
+                              (int)m_delList.size());
+                toast("SUBTITLES", msg);
+            }
+        }
+    } else {
+        m_r2HoldMs = 0;
+    }
+    /* The web search finishes on its own thread; refreshTracks only runs on
+     * enter and on activation, so without this the rows would keep saying
+     * SEARCHING long after the results landed. Rows from another movie are
+     * invisible (refreshTracks gates on the owner), so only poll while the
+     * search belongs to the file being played. */
+    const char *owner = evo_websub_owner();
+    const bool mine = owner[0] && current_media_path[0] &&
+                      strcmp(owner, current_media_path) == 0;
+    const int ws = mine ? evo_websub_status() : 0;
+    if (ws != m_lastWebStatus) {
+        if (m_lastWebStatus == 1 && ws == 2)
+            toast("SUBTITLES", evo_websub_stage());     /* "12 FOUND" */
+        else if (m_lastWebStatus == 1 && ws == 3)
+            toast("SUBTITLES", "NO SUBS FOUND");
+        m_lastWebStatus = ws;
+        const int keep = m_selectedIndex;
+        refreshTracks();
+        if (keep < static_cast<int>(m_tracks.size()))
+            m_selectedIndex = keep;
+    }
+
+    /* A download landing while the picker is open: the player's pump does
+     * NOT run while this screen is on top, so consume the ready event here
+     * and load it now - the state watch below then announces it and repaints
+     * with the new subtitle marked selected. */
+    char dpath[512];
+    char dlabel[96];
+    const int dr = evo_websub_take_ready(dpath, (int)sizeof dpath, dlabel, (int)sizeof dlabel);
+    if (dr == 1) {
+        if (prospero_secondary_use_external)
+            prospero_secondary_subtitle_select(PROSPERO_SECONDARY_NONE);
+        if (prospero_subtitle_load_file_quiet(dpath) <= 0) {
+            toast("SUBTITLES", "THAT FILE HAS NO SUBTITLES");
+            return;
+        }
+        std::snprintf(prospero_subtitle_external_label,
+                      sizeof prospero_subtitle_external_label, "%s",
+                      dlabel[0] ? dlabel : "WEB");
+        prospero_subtitle_use_external = 1;
+        prospero_subtitle_enabled = 1;
+        evo_feedback(EVO_FB_CONFIRM);
+    } else if (dr < 0) {
+        toast("SUBTITLES", evo_websub_stage());
+        return;
+    }
+
+    /* Watch the external-subtitle state: when a new subtitle has been
+     * loaded, announce it and repaint so the EXTERNAL row shows as the
+     * selected track. */
+    const int ext_count = prospero_subtitle_count;
+    const int ext_active = prospero_subtitle_enabled && prospero_subtitle_use_external;
+    const char *ext_label = prospero_subtitle_external_label;
+    if (ext_count != m_seenExtCount || ext_active != m_seenExtActive ||
+        strcmp(ext_label, m_seenExtLabel) != 0) {
+        if (ext_active && ext_count > 0 && m_seenExtLabel[0] &&
+            strcmp(ext_label, m_seenExtLabel) != 0) {
+            char msg[128];
+            std::snprintf(msg, sizeof msg, "%s LOADED", ext_label);
+            toast("SUBTITLES", msg);
+        }
+        m_seenExtCount = ext_count;
+        m_seenExtActive = ext_active;
+        std::snprintf(m_seenExtLabel, sizeof m_seenExtLabel, "%s", ext_label);
+        const int keep = m_selectedIndex;
+        refreshTracks();
+        if (keep < static_cast<int>(m_tracks.size()))
+            m_selectedIndex = keep;
+    }
 }
 
 void SubtitlePickerScreen::render(uint32_t* framebuffer, int width, int height) {
@@ -482,22 +832,65 @@ void SubtitlePickerScreen::render(uint32_t* framebuffer, int width, int height) 
     params.preview_face2 = size2_idx;
     params.cue_str = "";
 
-    params.eyebrow = "SUBTITLE CONFIGURATION";
-    params.title = "SUBTITLE TRACKS";
+    params.eyebrow = m_deleteMode ? "DELETE MODE - CROSS DELETES, CIRCLE CANCELS"
+                                  : "SUBTITLE CONFIGURATION";
+    params.title = m_deleteMode ? "DELETE SUBTITLES" : "SUBTITLE TRACKS";
+
+    /* DELETE MODE: the track list is replaced by everything EVO downloaded
+     * for this movie, in red. */
+    if (m_deleteMode) {
+        static char s_delLabel[96];
+        const int n = std::min(static_cast<int>(m_delList.size()), kVisibleRows);
+        params.track_count = n;
+        for (int i = 0; i < n; ++i) {
+            std::snprintf(s_delLabel, sizeof s_delLabel, "DEL: %s",
+                          m_delList[i].name.c_str());
+            params.tracks[i].label = s_delLabel;
+            params.tracks[i].detail = "DOWNLOADED BY EVO - CROSS DELETES";
+            params.tracks[i].is_focused = (i == m_selectedIndex);
+            params.tracks[i].is_current = 0;
+            params.tracks[i].is_action = 1;
+            /* is_disabled == 2 draws the row in red (see subtitles.rcss) */
+            params.tracks[i].is_disabled = 2;
+            params.tracks[i].tag = "";
+        }
+        evo_rmlui_update_subtitles(&params);
+        evo_rmlui_render_subtitles(framebuffer, width, height);
+        return;
+    }
 
     int total = static_cast<int>(m_tracks.size());
     int rowsToDisplay = std::min(kVisibleRows, std::max(0, total - m_scrollOffset));
     static char s_autoSyncDetail[48];
+    /* The selected marker is derived from live subtitle state every frame,
+     * not from the track-building pass: when a download lands mid-session
+     * the EXTERNAL row is current immediately, and whatever was marked
+     * before stops being marked. */
+    const bool ext_active = prospero_subtitle_enabled && prospero_subtitle_use_external &&
+                            prospero_subtitle_count > 0;
     params.track_count = rowsToDisplay;
     for (int i = 0; i < rowsToDisplay; ++i) {
         int idx = m_scrollOffset + i;
+        const int tid = m_tracks[idx].trackId;
         params.tracks[i].label = m_tracks[idx].label.c_str();
         params.tracks[i].detail = m_tracks[idx].detail.c_str();
         params.tracks[i].is_focused = (idx == m_selectedIndex);
-        params.tracks[i].is_current = (idx == m_activeTrackIndex);
+        bool current;
+        if (tid <= kExtSidecarBase && tid > kExtSidecarBase - kMaxExtSidecars) {
+            /* the sidecar row whose file is the loaded external subtitle */
+            current = ext_active && m_tracks[idx].extPath == prospero_subtitle_external_path();
+        } else if (tid == -1)            /* the plain EXTERNAL row */
+            current = ext_active;
+        else if (tid == -2)              /* OFF */
+            current = !prospero_subtitle_enabled;
+        else if (tid >= 0)               /* an embedded stream */
+            current = !ext_active && (idx == m_activeTrackIndex);
+        else                             /* action / web rows */
+            current = false;
+        params.tracks[i].is_current = current ? 1 : 0;
         // [PRIMARY] / [SECONDARY]: which line of dialogue each track is (#110).
         params.tracks[i].tag = m_tracks[idx].isSecondary ? "SECONDARY"
-                             : (idx == m_activeTrackIndex && idx != 0 &&
+                             : (current && idx != 0 &&
                                 m_tracks[idx].trackId != kAutoSyncTrack) ? "PRIMARY" : "";
         if (m_tracks[idx].trackId == kLoadFileTrack) {
             params.tracks[i].is_current = 0;
@@ -511,6 +904,16 @@ void SubtitlePickerScreen::render(uint32_t* framebuffer, int width, int height) 
             params.tracks[i].tag = "";
             params.tracks[i].is_disabled = !prospero_subtitle_autosync_running() &&
                                            !prospero_subtitle_autosync_available();
+        }
+        if (m_tracks[idx].trackId == kWebSearchTrack) {
+            params.tracks[i].is_current = 0;
+            params.tracks[i].is_action = 1;
+            params.tracks[i].tag = "";
+        }
+        /* A web row is not this file's track: no PRIMARY/SECONDARY badge
+         * until the download lands and becomes the external SRT. */
+        if (m_tracks[idx].trackId <= kWebSubBase) {
+            params.tracks[i].tag = "";
         }
     }
 

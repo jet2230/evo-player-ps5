@@ -4,6 +4,7 @@
 #include "evo_rmlui_bridge.h"
 #include "evo_feedback.h"
 #include "evo_toast.h"
+#include "evo_websub.h"
 #include "evo_theme.h"
 #include "evo_boot_log.h"
 #include "evo_prev_run.h"
@@ -72,6 +73,11 @@ enum class SettingKey : int {
     SecondaryColour,
     SecondaryPosition,
     SecondaryBackground,
+    /* docs/planning/websubs.md - web subtitle search */
+    SubsApiKeyOS,
+    SubsOsUser,
+    SubsOsPassword,
+    SubsApiKeySubdl,
     /* INTERFACE & STORAGE */
     Theme,
     Lightbar,
@@ -236,6 +242,8 @@ const SettingKey kSubtitleKeys[] = {
     SettingKey::SubtitleBackground,
     SettingKey::SecondarySize, SettingKey::SecondaryColour, SettingKey::SecondaryPosition,
     SettingKey::SecondaryBackground,
+    SettingKey::SubsApiKeyOS, SettingKey::SubsOsUser,
+    SettingKey::SubsOsPassword, SettingKey::SubsApiKeySubdl,
 };
 const SettingKey kInterfaceKeys[] = {
     SettingKey::Theme, SettingKey::Lightbar, SettingKey::FoldersFirst,
@@ -667,6 +675,56 @@ SettingDef makeDef(SettingKey key, ISettingsService* settings) {
                       actual > 0 ? "PHONE KEYBOARD LINK AND LIVE LOG - CROSS TO CHANGE"
                                  : "NO FREE PORT - CROSS TO SET A NEW ONE",
                       "../icons/icon_smartphone.png", s_port_badge);
+        break;
+    }
+
+    /* docs/planning/websubs.md - keys for the web subtitle search. */
+    case SettingKey::SubsApiKeyOS: {
+        static char s_os_badge[16];
+        char keybuf[128];
+        evo_websub_get_os_key(keybuf, (int)sizeof keybuf);
+        std::snprintf(s_os_badge, sizeof s_os_badge, "%s", keybuf[0] ? "SET" : "NOT SET");
+        d = actionDef(key, "OPENSUBTITLES API KEY",
+                      keybuf[0] ? "WEB SUBTITLE SEARCH - CROSS TO REPLACE IT"
+                                : "FREE KEY FROM OPENSUBTITLES.COM - CROSS TO ADD IT",
+                      "../icons/icon_subtitles.png", s_os_badge);
+        break;
+    }
+
+    case SettingKey::SubsOsUser: {
+        static char s_osu_badge[16];
+        char ubuf[128], pbuf[128];
+        evo_websub_get_os_user(ubuf, (int)sizeof ubuf, pbuf, (int)sizeof pbuf);
+        std::snprintf(s_osu_badge, sizeof s_osu_badge,
+                      "%s", (ubuf[0] && pbuf[0]) ? "SET" : "NOT SET");
+        d = actionDef(key, "OPENSUBTITLES ACCOUNT USER",
+                      (ubuf[0] && pbuf[0]) ? "NEEDED TO DOWNLOAD SUBS - CROSS TO CHANGE"
+                                           : "YOUR OPENSUBTITLES.COM LOGIN - DOWNLOADS NEED IT",
+                      "../icons/icon_subtitles.png", s_osu_badge);
+        break;
+    }
+
+    case SettingKey::SubsOsPassword: {
+        static char s_osp_badge[16];
+        char ubuf[128], pbuf[128];
+        evo_websub_get_os_user(ubuf, (int)sizeof ubuf, pbuf, (int)sizeof pbuf);
+        std::snprintf(s_osp_badge, sizeof s_osp_badge, "%s", pbuf[0] ? "SET" : "NOT SET");
+        d = actionDef(key, "OPENSUBTITLES ACCOUNT PASSWORD",
+                      pbuf[0] ? "SAVED - CROSS TO REPLACE IT"
+                              : "YOUR OPENSUBTITLES.COM PASSWORD",
+                      "../icons/icon_subtitles.png", s_osp_badge);
+        break;
+    }
+
+    case SettingKey::SubsApiKeySubdl: {
+        static char s_subdl_badge[16];
+        char keybuf[128];
+        evo_websub_get_subdl_key(keybuf, (int)sizeof keybuf);
+        std::snprintf(s_subdl_badge, sizeof s_subdl_badge, "%s", keybuf[0] ? "SET" : "NOT SET");
+        d = actionDef(key, "SUBDL API KEY",
+                      keybuf[0] ? "WEB SUBTITLE SEARCH - CROSS TO REPLACE IT"
+                                : "FREE KEY FROM SUBDL.COM - CROSS TO ADD IT",
+                      "../icons/icon_subtitles.png", s_subdl_badge);
         break;
     }
 
@@ -1166,6 +1224,32 @@ void onPortEntered(const char* text, void*) {
     }
 }
 
+/* docs/planning/websubs.md - the key lives in its own data file, not in the
+ * settings service, so nothing to save here. */
+void onOsKeyEntered(const char* text, void*) {
+    evo_websub_set_os_key(text ? text : "");
+    toast("OPENSUBTITLES", text && text[0] ? "API KEY SAVED" : "API KEY CLEARED");
+}
+
+void onOsUserEntered(const char* text, void*) {
+    char user[128], pass[128];
+    evo_websub_get_os_user(user, (int)sizeof user, pass, (int)sizeof pass);
+    evo_websub_set_os_user(text ? text : "", pass);
+    toast("OPENSUBTITLES", text && text[0] ? "USER SAVED" : "USER CLEARED");
+}
+
+void onOsPasswordEntered(const char* text, void*) {
+    char user[128], pass[128];
+    evo_websub_get_os_user(user, (int)sizeof user, pass, (int)sizeof pass);
+    evo_websub_set_os_user(user, text ? text : "");
+    toast("OPENSUBTITLES", text && text[0] ? "PASSWORD SAVED" : "PASSWORD CLEARED");
+}
+
+void onSubdlKeyEntered(const char* text, void*) {
+    evo_websub_set_subdl_key(text ? text : "");
+    toast("SUBDL", text && text[0] ? "API KEY SAVED" : "API KEY CLEARED");
+}
+
 void onYouTubeLinkEntered(const char* text, void*) {
     if (!text || !text[0]) return;
     evo::CastService* cs = evo::Application::getInstance().getCastService();
@@ -1207,6 +1291,37 @@ bool runAction(const SettingDef& def) {
         std::snprintf(init, sizeof init, "%d", evo_log_server_saved_port());
         evo_feedback(EVO_FB_OPEN);
         evo_keyboard_open_number("PHONE & LOG PORT (1024-65535)", init, 5, onPortEntered, nullptr);
+        return true;
+    }
+    case SettingKey::SubsApiKeyOS: {
+        char init[128];
+        evo_websub_get_os_key(init, (int)sizeof init);
+        evo_feedback(EVO_FB_OPEN);
+        evo_keyboard_open("OPENSUBTITLES API KEY", init, 96, onOsKeyEntered, nullptr);
+        return true;
+    }
+    case SettingKey::SubsOsUser: {
+        char init[128];
+        char pass[128];
+        evo_websub_get_os_user(init, (int)sizeof init, pass, (int)sizeof pass);
+        evo_feedback(EVO_FB_OPEN);
+        evo_keyboard_open("OPENSUBTITLES USER", init, 96, onOsUserEntered, nullptr);
+        return true;
+    }
+    case SettingKey::SubsOsPassword: {
+        char user[128];
+        char pass[128];
+        evo_websub_get_os_user(user, (int)sizeof user, pass, (int)sizeof pass);
+        evo_feedback(EVO_FB_OPEN);
+        evo_keyboard_mark_secret();
+        evo_keyboard_open("OPENSUBTITLES PASSWORD", pass, 96, onOsPasswordEntered, nullptr);
+        return true;
+    }
+    case SettingKey::SubsApiKeySubdl: {
+        char init[128];
+        evo_websub_get_subdl_key(init, (int)sizeof init);
+        evo_feedback(EVO_FB_OPEN);
+        evo_keyboard_open("SUBDL API KEY", init, 96, onSubdlKeyEntered, nullptr);
         return true;
     }
     case SettingKey::YouTubeLink:

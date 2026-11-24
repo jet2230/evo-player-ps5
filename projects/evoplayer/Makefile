@@ -170,6 +170,7 @@ ADDON_SRCS := \
     addons/src/provider_nuvio.c \
     addons/src/provider_stremio.c \
     addons/src/evo_online_subs.c \
+    addons/src/evo_websub.c \
     addons/src/evo_stremio_account.c \
     addons/src/evo_yt_link.c \
     addons/src/evo_ytjs_blob.c \

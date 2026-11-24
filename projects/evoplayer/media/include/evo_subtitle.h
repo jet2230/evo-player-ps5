@@ -103,6 +103,17 @@ extern int dbg_sub_cid;
 
 /* ---- lifecycle (demux/seek/open/close) ---- */
 void prospero_subtitle_clear(void);
+
+/* Unload the external subtitle and delete its backing file - but only when
+ * EVO wrote that file itself (a downloaded web/online pick under the data
+ * dir). A sidecar the user loaded from their own drive is unloaded, never
+ * deleted. Returns 1 when something was unloaded, 0 when there was no
+ * external subtitle. */
+int prospero_subtitle_external_delete(void);
+
+/* Path of the currently loaded external subtitle ("" none) - the picker
+ * uses it to mark which sidecar row is active. */
+const char *prospero_subtitle_external_path(void);
 int  prospero_subtitle_load_for_media(const char *media_path);
 /* Load one subtitle file the caller fetched (a media server's sidecar); returns the cue count. */
 int  prospero_subtitle_load_external(const char *path);

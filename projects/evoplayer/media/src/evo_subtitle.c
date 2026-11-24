@@ -10,6 +10,7 @@
 #include "evo_ntfs.h"
 #include "evo_subtitle.h"
 #include "evo_langpref.h"
+#include "evo_data_path.h"
 #include <stdbool.h>
 #include <ctype.h>
 
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
+#include <dirent.h>
 
 #include <libavutil/avutil.h>
 #include <libavutil/dict.h>
@@ -1640,6 +1642,10 @@ int prospero_subtitle_face = 2;  /* 1 SMALL, 2 MEDIUM (DEFAULT), 3 LARGE, 4 EXTR
 
 static char prospero_subtitle_path[512] = {0};
 
+const char *prospero_subtitle_external_path(void) {
+    return prospero_subtitle_path;
+}
+
 
 /* What the external track is, for the picker ("Italiano · ONLINE"); "" = a
  * plain sidecar SRT. */
@@ -1655,6 +1661,48 @@ void prospero_subtitle_clear(void) {
     prospero_subtitle_delay_ms = 0;
     prospero_subtitle_time_scale = 1.0;
     prospero_secondary_delay_ms = 0;
+}
+
+
+int prospero_subtitle_external_delete(void) {
+    if (!prospero_subtitle_path[0] && prospero_subtitle_count <= 0)
+        return 0;
+
+    char path[512];
+    snprintf(path, sizeof path, "%s", prospero_subtitle_path);
+
+    prospero_subtitle_clear();
+    prospero_subtitle_use_external = 0;
+    prospero_subtitle_enabled = 0;
+
+    /* Delete the file only when EVO wrote it itself: a downloaded pick under
+     * the data dir, or a sidecar next to the movie named off the movie's own
+     * name (<movie>.srt / <movie>.<lang>.srt). A sidecar the user loaded
+     * from anywhere else is unloaded but never deleted. */
+    int ours = 0;
+    const char *root = evo_data_path("");
+    size_t root_len = strlen(root);
+    if (root_len > 0 && strncmp(path, root, root_len) == 0) {
+        ours = 1;
+    } else if (current_media_path[0]) {
+        char stem[512];
+        snprintf(stem, sizeof stem, "%s", current_media_path);
+        char *dot = strrchr(stem, '.');
+        if (dot && dot != stem && !strchr(dot, '/')) *dot = 0;   /* drop extension */
+        size_t slen = strlen(stem);
+        if (strncmp(path, stem, slen) == 0) {
+            const char *rest = path + slen;                      /* ".srt" or ".en.srt" */
+            size_t rl = strlen(rest);
+            ours = (strcmp(rest, ".srt") == 0) ||
+                   (rl > 5 && rest[0] == '.' &&
+                    strcmp(rest + rl - 4, ".srt") == 0);
+        }
+    }
+    if (ours) {
+        if (remove(path) == 0)
+            evo_boot_log("websub: deleted downloaded subtitle %s", path);
+    }
+    return 1;
 }
 
 
@@ -2330,66 +2378,93 @@ int prospero_subtitle_load_for_media(
 
     char sidecar_path[512];
 
-    if (
-        prospero_subtitle_sidecar_path(
-            media_path,
-            sidecar_path,
-            sizeof(sidecar_path),
-            ".srt"
-        )
-    ) {
-        int count =
-            prospero_subtitle_load_file(
-                sidecar_path
-            );
+    /* Scanned best-first, so downloaded language sidecars auto-load:
+     *   1. <movie>.<your SUBTITLE LANGUAGE>.srt     (e.g. Movie.en.srt)
+     *   2. <movie>.srt                              (the classic sidecar)
+     *   3. <movie>.<anything>.srt (first found)
+     * Increments (Movie.en.2.srt) rank like their base language, newest
+     * numbered file first is NOT tracked - the plain language name wins. */
+    const char *pref = evo_langpref_subtitle();
+    char pref3[4] = {0};
+    int have_pref = pref && pref[0] && evo_lang_normalize(pref, pref3) == 0;
 
-        if (count > 0) {
-            char message[96];
+    int best_count = 0;
+    char best_path[512] = {0};
+    int best_rank = -1;
 
-            snprintf(
-                message,
-                sizeof(message),
-                "Loaded %d cues",
-                count
-            );
+    /* rank a sidecar candidate's suffix (".srt" / ".en.srt" / ".en.2.srt") */
+    #define SUFFIX_RANK(rest_, rl_) ({                                          \
+        int _r = 1;                                                             \
+        if (strcmp((rest_), ".srt") == 0 || strcmp((rest_), ".SRT") == 0)       \
+            _r = 10;                                                            \
+        else if ((rest_)[0] == '.') {                                           \
+            char tag[16];                                                       \
+            int ti = 0;                                                         \
+            const char *q = (rest_) + 1;                                        \
+            while (*q && *q != '.' && ti < 15) tag[ti++] = *q++;                \
+            tag[ti] = 0;                                                        \
+            if (have_pref && evo_lang_is(tag, pref3))                           \
+                _r = 20;                                                        \
+            else if (strcasecmp(tag, "en") == 0)                                \
+                _r = 5;                                                         \
+        }                                                                       \
+        _r;                                                                     \
+    })
 
-            toast(
-                "SUBTITLES",
-                message
-            );
+    if (media_path && media_path[0] == '/') {
+        const char *slash = strrchr(media_path, '/');
+        if (slash && slash[1]) {
+            char stem[256];
+            snprintf(stem, sizeof stem, "%s", slash + 1);
+            char *dot = strrchr(stem, '.');
+            if (dot && dot != stem) *dot = 0;
+            char dir[600];
+            snprintf(dir, sizeof dir, "%.*s", (int)(slash - media_path + 1), media_path);
 
-            return count;
+            DIR *d = opendir(dir);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    const char *name = e->d_name;
+                    size_t nl = strlen(name);
+                    if (strncmp(name, stem, strlen(stem)) != 0) continue;
+                    if (nl <= strlen(stem) + 4) continue;
+                    const char *rest = name + strlen(stem);
+                    size_t rl = strlen(rest);
+                    if (strcmp(rest, ".srt") != 0 && strcmp(rest, ".SRT") != 0 &&
+                        !(rl > 4 && strcasecmp(rest + rl - 4, ".srt") == 0))
+                        continue;
+                    int r = SUFFIX_RANK(rest, rl);
+                    if (r > best_rank) {
+                        best_rank = r;
+                        snprintf(best_path, sizeof best_path, "%s%s", dir, name);
+                        if (r >= 20) break;   /* the preferred language: done */
+                    }
+                }
+                closedir(d);
+            }
+        }
+    }
+    #undef SUFFIX_RANK
+
+    /* fall back to the classic exact sidecar when the folder scan found
+     * nothing (covers the .SRT case-insensitivity rules of the old code) */
+    if (best_rank < 0) {
+        if (prospero_subtitle_sidecar_path(media_path, sidecar_path,
+                                           sizeof(sidecar_path), ".srt") ||
+            prospero_subtitle_sidecar_path(media_path, sidecar_path,
+                                           sizeof(sidecar_path), ".SRT")) {
+            snprintf(best_path, sizeof best_path, "%s", sidecar_path);
+            best_rank = 10;
         }
     }
 
-    if (
-        prospero_subtitle_sidecar_path(
-            media_path,
-            sidecar_path,
-            sizeof(sidecar_path),
-            ".SRT"
-        )
-    ) {
-        int count =
-            prospero_subtitle_load_file(
-                sidecar_path
-            );
-
+    if (best_path[0]) {
+        int count = prospero_subtitle_load_file(best_path);
         if (count > 0) {
             char message[96];
-
-            snprintf(
-                message,
-                sizeof(message),
-                "Loaded %d cues",
-                count
-            );
-
-            toast(
-                "SUBTITLES",
-                message
-            );
-
+            snprintf(message, sizeof(message), "Loaded %d cues", count);
+            toast("SUBTITLES", message);
             return count;
         }
     }

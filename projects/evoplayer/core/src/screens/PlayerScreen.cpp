@@ -10,6 +10,7 @@
 #include "evo_audio_out.h"
 #include "evo_subtitle.h"
 #include "evo_online_subs.h"
+#include "evo_websub.h"
 #include "evo_vdec.h"
 #include "evo_perf_monitor.h"
 #include "evo_toast.h"
@@ -586,10 +587,45 @@ static void pumpOnlineSubtitles()
     toast("SUBTITLES", msg);
 }
 
+/* docs/planning/websubs.md: a web-subtitle download (subtitle picker, ONLINE
+ * (WEB) rows) has landed - load it here, on the thread that draws subtitles,
+ * exactly like the Stremio online subs above. */
+static void pumpWebSubtitles()
+{
+    char path[512];
+    char label[96] = {0};
+    const int state = evo_websub_take_ready(path, (int)sizeof path, label, (int)sizeof label);
+    if (state == 0)
+        return;
+    if (state < 0) {
+        /* the module puts the reason on its stage ("ADD YOUR OPENSUBTITLES
+         * ACCOUNT IN SETTINGS", daily limit, unreachable) */
+        toast("SUBTITLES", evo_websub_stage());
+        return;
+    }
+    if (prospero_secondary_use_external)
+        prospero_secondary_subtitle_select(PROSPERO_SECONDARY_NONE);
+    if (prospero_subtitle_load_file_quiet(path) <= 0) {
+        toast("SUBTITLES", "THAT FILE HAS NO SUBTITLES");
+        return;
+    }
+    std::snprintf(prospero_subtitle_external_label, sizeof prospero_subtitle_external_label,
+                  "%s", label[0] ? label : "WEB");
+    prospero_subtitle_use_external = 1;
+    prospero_subtitle_enabled = 1;
+    char msg[128];
+    if (evo_websub_take_was_cached())
+        std::snprintf(msg, sizeof msg, "ALREADY ON DISK - %s LOADED", label[0] ? label : "SUBS");
+    else
+        std::snprintf(msg, sizeof msg, "%s (WEB)", label[0] ? label : "SUBTITLE");
+    toast("SUBTITLES", msg);
+}
+
 void PlayerScreen::update(double deltaMs) {
     StatefulScreen::update(deltaMs);
     m_playerFsm.update(deltaMs);
     pumpOnlineSubtitles();
+    pumpWebSubtitles();
 
     auto playback = Application::getInstance().getPlaybackController();
     if (!playback) return;

@@ -90,6 +90,7 @@ selection on the played item (#214). See [../../CHANGELOG.md](../../CHANGELOG.md
 | #43 | Render styled `.ass`/`.ssa` subtitles: position and colour (investigate) |
 | #112 | Faster subtitle auto-sync: reuse the played audio, stop early, cache results (`medium`) |
 | #128 | Fonts for every script. Latin extended, Greek, Cyrillic, Hebrew, Arabic, Thai and Indic are in; CJK loads from `/data/evoplayer/fonts/`; emoji is not |
+| — | Web subtitle search for locally-played files: OpenSubtitles / Podnapisi / SubDL, hash + filename search, zip unzip, picker rows (`planning: docs/planning/websubs.md`) |
 
 ## Providers and storage
 
